@@ -1,0 +1,574 @@
+@Library(['com.optum.jenkins.pipeline.library', 'com.optum.P2020.pipeline.library']) _
+
+def updateVersion() {
+    def props = readProperties(file: 'build.properties')
+    props['version'] = props['version'] + '.' + env.BUILD_NUMBER
+    env.VERSION = props['version']
+}
+
+def importFile(cred_id, file_name, file_path) {
+    withCredentials([file(credentialsId: cred_id, variable: 'cert_file')]) {
+        sh label: "Import Cert File ${cred_id}", script: """
+        cp ${cert_file} ${file_path}/${file_name}
+        """
+    }
+}
+
+def importCertFiles(env_name) {
+        importFile(env.CRT_FILE_ID, "${env_name}.crt", "./crt_files")
+        importFile(env.PEM_FILE_ID, "${env_name}.com-chain.pem", "./crt_files")
+        importFile(env.KEY_FILE_ID, "${env_name}.pem", "./crt_files")
+}
+
+def importCertFilesComodoInternal(env_name) {
+        importFile(env.INTERNAL_COMODO_CRT_FILE_ID, "${env_name}_internal_comodo.crt", "./crt_files")
+        importFile(env.INTERNAL_COMODO_PEM_FILE_ID, "${env_name}_internal_comodo.com-chain.pem", "./crt_files")
+        importFile(env.INTERNAL_COMODO_KEY_FILE_ID, "${env_name}_internal_comodo.pem", "./crt_files")
+}
+
+def buildLambdaLayerWithDockerfile(layerName) {
+    sh """
+        echo "invoking build_lamda_layer_dockerfile.sh to create the lambda layer: ${layerName}"
+        ./build_lambda_layer_dockerfile.sh ${layerName}
+    """
+}
+
+pipeline {
+    agent {label 'docker-kitchensink-slave-centos8-tf-latest'}
+
+    options {
+        disableConcurrentBuilds()
+        skipStagesAfterUnstable()
+        buildDiscarder(logRotator(numToKeepStr: '10', artifactNumToKeepStr: '10'))
+    }
+
+    environment {
+        AGENT_CREDENTIAL            = 'd277edb5-1a50-4882-a446-65a29535636d'
+        TERRAFORM_VERSION           = "1.9.2"
+        PYTHON_VERSION              = "3.10"
+        DOCKER_VERSION              = "27"
+        ROLE                        = getRole("${params.Environment}")
+        RDS_CREDS                   = getRdsCreds("${params.Environment}")
+        PCA_DB_CREDS                = getPcaDbCreds("${params.Environment}")
+        PAT_DB_CREDS                = getPatDbCreds("${params.Environment}")
+        DE_DB_CREDS                 = getDeDbCreds("${params.Environment}")
+        CRT_FILE_ID                 = getCrtFileId("${params.Environment}")
+        PEM_FILE_ID                 = getPemFileId("${params.Environment}")
+        KEY_FILE_ID                 = getKeyFileId("${params.Environment}")
+        INTERNAL_COMODO_CRT_FILE_ID = getInternalComodoCrtFileId("${params.Environment}")
+        INTERNAL_COMODO_PEM_FILE_ID = getInternalComodoPemFileId("${params.Environment}")
+        INTERNAL_COMODO_KEY_FILE_ID = getInternalComodoKeyFileId("${params.Environment}")
+        AD_CREDS                    = getAdCreds("${params.Environment}")
+        AD_ADMIN_1_CREDS            = getAdAdmin1Creds("${params.Environment}")
+        AD_ADMIN_2_CREDS            = getAdAdmin2Creds("${params.Environment}")
+        CMA_DB_CREDS                = getCmaDBCreds("${params.Environment}")
+        CMA_AD_CREDS                = getCmaADCreds("${params.Environment}")
+        
+    }
+    
+    parameters
+    {
+        choice(
+            name:'Environment',
+            choices:['dev','qa','stage','prod','nonprod-shared','prod-shared'],
+            description:'Environment to resources to be provisioned'
+        ) 
+        booleanParam(name: 'createLambdaLayer', defaultValue: false, description: 'If true lambda layer will be recreated')
+        booleanParam(name: 'createPsycopg2LambdaLayer', defaultValue: false, description: 'If true psycopg2 lambda layer will be recreated')
+        booleanParam(name: 'createEssInvocationLambdaLayer', defaultValue: false, description: 'If true ESS Invocation lambda layer will be recreated')
+        booleanParam(name: 'createPyMysqlLambdaLayer', defaultValue: false, description: 'If true pymysql lambda layer will be recreated')
+        booleanParam(name: 'createCryptographyLambdaLayer', defaultValue: false, description: 'If true cryptography lambda layer will be recreated')
+        booleanParam(name: 'destroyResources', defaultValue: false, description: 'If true resources will be destroyed and will not be recreated')
+    }
+
+    triggers {
+        pollSCM('H */5 * * *')
+    }
+
+    stages {
+
+        stage('Checkout') 
+        {
+            steps
+            {
+                cleanWs()
+                checkout scm
+            }
+        }
+
+        stage('Import Cert Files')
+        {
+            steps
+            {
+                script
+                {
+                    sh "mkdir crt_files"
+
+                    importCertFilesComodoInternal("${params.Environment}")
+
+                    if ("${params.Environment}"!="nonprod-shared" && "${params.Environment}"!="prod-shared"){
+                        importCertFiles("${params.Environment}")
+                    }
+                }
+            }
+        }
+        
+        stage('Configure AWS') 
+        {
+            steps
+            {
+                script {
+                    omaConfigureGitGlobalAuth()
+                    omaAwsAuthenticateIAMUser(params.Environment)
+                    command """
+                        aws configure set region us-east-1
+                    """
+                }
+            }
+        }
+
+        stage('Build Lambda Layer') {
+            when {
+                expression {
+                    params.createLambdaLayer
+                }
+            }
+            steps {
+                script {
+                    container_id = 'lambda-layer-container'
+
+                    command """
+                    echo lambda layer build started
+
+                    docker stop ${container_id} || true && docker rm ${container_id} || true
+                    docker run -d -it --name ${container_id} docker.repo1.uhc.com/sam/build-python3.10
+                    docker cp build_lambda_layer.sh ${container_id}:/root
+                    docker exec ${container_id} sh /root/build_lambda_layer.sh /root ${params.Environment}
+                    docker cp ${container_id}:/root/lambda-layer .
+                    docker stop ${container_id}
+
+                    echo lambda layer build completed 
+                    """
+                }
+            }
+        }
+
+        stage('Build cryptography Lambda Layer') {
+            when {
+                expression {
+                    params.createCryptographyLambdaLayer
+                }
+            }
+            steps {
+                script {                    
+                    buildLambdaLayerWithDockerfile('cryptography_lambda_layer')
+                }
+            }
+        }
+
+        stage('Build pymysql Lambda Layer') {
+            when {
+                expression {
+                    params.createPyMysqlLambdaLayer
+                }
+            }
+            steps {
+                script {                    
+                    buildLambdaLayerWithDockerfile('pymysql_lambda_layer')
+                }
+            }
+        }
+
+        stage('Build Psycopg2 Lambda Layer') {
+            when {
+                expression {
+                    params.createPsycopg2LambdaLayer
+                }
+            }
+            steps {
+                script {                    
+                    buildLambdaLayerWithDockerfile('psycopg2_lambda_layer')
+                }
+            }
+        }
+
+        stage('Build ESS Invocation Lambda Layer') {
+            when {
+                expression {
+                    params.createEssInvocationLambdaLayer
+                }
+            }
+            steps {
+                script {                    
+                    buildLambdaLayerWithDockerfile('ess_invocation_lambda_layer')
+                }
+            }
+        }
+
+        stage('Authenticate Vault') {
+            steps {
+                script {
+                    
+                    withVaultSecrets(credentialsId: 'VAULT_SECRET_ID',
+                    appRoleId: "a699b007-8006-4ce7-ca16-6ca12b70859c",
+                    namespace: "/OPTUM/APP/OMA/PROD/",
+                    secretPath: "/hcp-pcam/data/oma-uhg-provider-secrets",
+                    keys:[
+                        "ClientId",
+                        "ClientSecret"
+                    ]) {
+                        env.UHG_PROVIDER_CRED_CLIENT_ID = ClientId
+                        env.UHG_PROVIDER_CRED_CLIENT_SECRET = ClientSecret
+                    }
+                }
+            }
+        }
+
+        stage("Init Plans")
+        {
+
+            when { expression { !params.destroyResources} }
+
+            steps
+            {
+                        sh """
+                        . /etc/profile.d/jenkins.sh
+                        cd terraform/environments/${params.Environment}
+                        terraform -version
+                        terraform init -input=false
+                    """
+            }
+        }
+
+        stage("Validate and Plan")
+        {
+            when { expression { !params.destroyResources} }
+
+            environment {
+                RDS_CREDS_LOCAL             = credentials("${env.RDS_CREDS}")
+                PCA_DB_CREDS_LOCAL          = credentials("${env.PCA_DB_CREDS}")
+                PAT_DB_CREDS_LOCAL          = credentials("${env.PAT_DB_CREDS}")
+                DE_DB_CREDS_LOCAL           = credentials("${env.DE_DB_CREDS}")
+                AD_CREDS_LOCAL              = credentials("${env.AD_CREDS}")
+                AD_ADMIN_1_CREDS_LOCAL    = credentials("${env.AD_ADMIN_1_CREDS}")
+                AD_ADMIN_2_CREDS_LOCAL    = credentials("${env.AD_ADMIN_2_CREDS}")
+                CMA_DB_CREDS              = credentials("${CMA_DB_CREDS}")
+                CMA_AD_CREDS              = credentials("${CMA_AD_CREDS}")
+               
+            }
+
+            steps
+            {
+                script 
+                {
+                    sh """#!/bin/bash -l
+                    . /etc/profile.d/jenkins.sh
+                    cd terraform/environments/${params.Environment}
+                    echo "Terraform Plan"
+                    if [[ "${params.Environment}" == "nonprod-shared" || "${params.Environment}" == "prod-shared" ]]; then
+                        TFVARS="-var build_version=${env.VERSION} -var create_ess_invocation_lambda_layer=${params.createEssInvocationLambdaLayer}\
+                            -var ad_parameter_usr=${AD_CREDS_LOCAL_USR} -var ad_parameter_psw=${AD_CREDS_LOCAL_PSW} \
+                            -var ad_admin1_parameter_usr=${AD_ADMIN_1_CREDS_LOCAL_USR} -var ad_admin1_parameter_psw=${AD_ADMIN_1_CREDS_LOCAL_PSW} \
+                            -var ad_admin2_parameter_usr=${AD_ADMIN_2_CREDS_LOCAL_USR} -var ad_admin2_parameter_psw=${AD_ADMIN_2_CREDS_LOCAL_PSW}  \
+                            -var uhg_provider_client_id=${env.UHG_PROVIDER_CRED_CLIENT_ID} -var uhg_provider_client_secret=${env.UHG_PROVIDER_CRED_CLIENT_SECRET} "
+                    else
+                        TFVARS="-var build_version=${env.VERSION} \
+                            -var create_lambda_layer=${params.createLambdaLayer} -var create_psycopg2_lambda_layer=${params.createPsycopg2LambdaLayer} -var create_cryptography_lambda_layer=${params.createCryptographyLambdaLayer} -var create_pymysql_lambda_layer=${params.createPyMysqlLambdaLayer}\
+                            -var pca_parameter_usr=${PCA_DB_CREDS_LOCAL_USR} -var pca_parameter_psw=${PCA_DB_CREDS_LOCAL_PSW} \
+                            -var pat_parameter_usr=${PAT_DB_CREDS_LOCAL_USR} -var pat_parameter_psw=${PAT_DB_CREDS_LOCAL_PSW} -var de_parameter_usr=${DE_DB_CREDS_LOCAL_USR} \
+                            -var de_parameter_psw=${DE_DB_CREDS_LOCAL_PSW} -var rds_parameter_usr=${RDS_CREDS_LOCAL_USR} -var rds_parameter_psw=${RDS_CREDS_LOCAL_PSW} \
+                            -var cma_db_parameter_usr=${CMA_DB_CREDS_USR} -var cma_db_parameter_psw=${CMA_DB_CREDS_PSW} -var cma_ad_parameter_usr=${CMA_AD_CREDS_USR} \
+                            -var cma_ad_parameter_psw=${CMA_AD_CREDS_PSW}"
+                    fi
+                    terraform validate
+                    terraform plan -input=false -lock=true -refresh=true \$TFVARS
+                """
+                }
+            }
+        }
+
+        stage("Apply Changes")
+        {
+            when { 
+                    allOf {
+                        expression { !params.destroyResources}
+                    }
+                }
+            
+            environment {
+                RDS_CREDS_LOCAL           = credentials("${env.RDS_CREDS}")
+                PCA_DB_CREDS_LOCAL        = credentials("${env.PCA_DB_CREDS}")
+                PAT_DB_CREDS_LOCAL        = credentials("${env.PAT_DB_CREDS}")
+                DE_DB_CREDS_LOCAL         = credentials("${env.DE_DB_CREDS}")
+                AD_CREDS_LOCAL            = credentials("${env.AD_CREDS}")
+                AD_ADMIN_1_CREDS_LOCAL    = credentials("${env.AD_ADMIN_1_CREDS}")
+                AD_ADMIN_2_CREDS_LOCAL    = credentials("${env.AD_ADMIN_2_CREDS}")
+                CMA_DB_CREDS              = credentials("${CMA_DB_CREDS}")
+                CMA_AD_CREDS              = credentials("${CMA_AD_CREDS}")
+            }
+
+            steps
+            {           
+                script 
+                {
+                     if (!params.autoApprove) {
+                        glApproval message: "Caution!!! Does the plan for ${params.Environment} look ok?", time: 15, unit: 'MINUTES'
+                     }            
+                        
+                        sh """#!/usr/bin/env bash
+                        . /etc/profile.d/jenkins.sh
+                        cd terraform/environments/${params.Environment}
+                        if [[ "${params.Environment}" == "nonprod-shared" || "${params.Environment}" == "prod-shared" ]]; then
+                            TFVARS="-var build_version=${env.VERSION} -var create_ess_invocation_lambda_layer=${params.createEssInvocationLambdaLayer} \
+                                -var ad_parameter_usr=${AD_CREDS_LOCAL_USR} -var ad_parameter_psw=${AD_CREDS_LOCAL_PSW} \
+                                -var ad_admin1_parameter_usr=${AD_ADMIN_1_CREDS_LOCAL_USR} -var ad_admin1_parameter_psw=${AD_ADMIN_1_CREDS_LOCAL_PSW} \
+                                -var ad_admin2_parameter_usr=${AD_ADMIN_2_CREDS_LOCAL_USR} -var ad_admin2_parameter_psw=${AD_ADMIN_2_CREDS_LOCAL_PSW} \
+                                -var uhg_provider_client_id=${env.UHG_PROVIDER_CRED_CLIENT_ID} -var uhg_provider_client_secret=${env.UHG_PROVIDER_CRED_CLIENT_SECRET} "
+                        else
+                            TFVARS="-var build_version=${env.VERSION} \
+                                -var create_lambda_layer=${params.createLambdaLayer} -var create_psycopg2_lambda_layer=${params.createPsycopg2LambdaLayer} -var create_cryptography_lambda_layer=${params.createCryptographyLambdaLayer} -var create_pymysql_lambda_layer=${params.createPyMysqlLambdaLayer}\
+                                -var pca_parameter_usr=${PCA_DB_CREDS_LOCAL_USR} -var pca_parameter_psw=${PCA_DB_CREDS_LOCAL_PSW} \
+                                -var pat_parameter_usr=${PAT_DB_CREDS_LOCAL_USR} -var pat_parameter_psw=${PAT_DB_CREDS_LOCAL_PSW} -var de_parameter_usr=${DE_DB_CREDS_LOCAL_USR} \
+                                -var de_parameter_psw=${DE_DB_CREDS_LOCAL_PSW} -var rds_parameter_usr=${RDS_CREDS_LOCAL_USR} -var rds_parameter_psw=${RDS_CREDS_LOCAL_PSW} \
+                                -var cma_db_parameter_usr=${CMA_DB_CREDS_USR} -var cma_db_parameter_psw=${CMA_DB_CREDS_PSW} -var cma_ad_parameter_usr=${CMA_AD_CREDS_USR} \
+                                -var cma_ad_parameter_psw=${CMA_AD_CREDS_PSW}"
+                        fi
+                        terraform apply -input=false -lock=true -refresh=true -auto-approve -parallelism=1  \$TFVARS
+                    """
+                }
+            }
+        }
+        stage("Destroy Plan")
+        {
+            when { 
+                    allOf {
+                        expression { params.destroyResources}
+                    }
+                }
+            steps
+            {           
+                script 
+                {           
+                        
+                        sh """#!/bin/bash -l
+                        . /etc/profile.d/jenkins.sh
+                        cd terraform/environments/${params.Environment}
+                        terraform plan -destroy
+                    """
+                }
+            }
+        }
+        stage("Destroy Apply")
+        {
+            when { 
+                    allOf {
+                        expression { params.destroyResources}
+                    }
+                }
+            steps
+            {           
+                script 
+                {
+                     if (!params.autoApprove) {
+                        glApproval message: "Caution!!! Does the plan for ${params.Environment} look ok?", time: 15, unit: 'MINUTES'
+                     }            
+                        
+                        sh """#!/bin/bash -l
+                        . /etc/profile.d/jenkins.sh
+                        cd terraform/environments/${params.Environment}
+                        terraform destroy -auto-approve 
+                    """
+                }
+            }
+        }
+        stage('Create and Publish Docker Image') {
+            when {
+                expression { params.Environment in ['dev', 'qa', 'stage', 'prod'] }
+            }
+            steps {
+                script {
+                    awsRegion = 'us-east-1'
+                    awsHccAccount = omaGetAwsAccountNum(params.Environment)
+                    repoName = "image-generation_${params.Environment}"
+                    registry = "${awsHccAccount}.dkr.ecr.${awsRegion}.amazonaws.com"
+                    /* Using the AWS CLI v2 command below is necessary to authenticate with Docker, 
+                     the command in Global Pipeline will not be able to authenticate as it is using AWS CLI v1 */
+                    command "aws ecr get-login-password --region ${awsRegion} | docker login --username AWS --password-stdin ${registry}"
+
+                    dir("docker_images/image_generation") {
+                        glAmazonEcrImageBuildPush([
+                            ecrName: repoName,
+                            ecrUrl: registry,
+                            region: awsRegion
+                        ])
+                    }        
+                }
+            }
+        }
+    }
+    post {
+        always {
+            echo 'Clean up workspace'
+            cleanWs()
+        }
+    }
+}
+
+def getRole(String environment) {
+    switch(environment) {
+        case "prod":
+        case "stage": return "arn:aws:iam::660577232581:role/AWS_660577232581_Automation"
+        case "prod-shared" : return "arn:aws:iam::660577232581:role/AWS_660577232581_Automation"
+        default: return "arn:aws:iam::486715895955:role/AWS_486715895955_Automation"
+    }
+}
+
+def getRdsCreds (String environment) {
+    switch(environment) {
+        case "prod": return '11834805-1a77-4126-aa1f-062dadd5125p'
+        case "stage": return '11834805-1a77-4126-aa1f-062dadd5125q'
+        case "dev": return 'rds_master_credentials_dev'
+        case "qa": return 'rds_master_credentials_qa'
+        default: return 'rds_master_credentials_dev'
+    }
+}
+def getPcaDbCreds (String environment) {
+    switch(environment) {
+        case "prod": return '11834805-1a77-4126-aa1f-062dadd5128w'
+        case "stage": return '11834805-1a77-4126-aa1f-062dadd5127v'
+        case "dev": return '11834805-1a77-4126-aa1f-062dadd5137f'
+        case "qa": return '11834805-1a77-4126-aa1f-062dadd5138g'
+        default: return '11834805-1a77-4126-aa1f-062dadd5137f'
+    }
+}
+def getPatDbCreds (String environment) {
+    switch(environment) {
+        case "prod": return '11834805-1a77-4126-aa1f-062dadd5130y'
+        case "stage": return '11834805-1a77-4126-aa1f-062dadd5129x'
+        case "dev": return '11834805-1a77-4126-aa1f-062dadd5139h'
+        case "qa": return '11834805-1a77-4126-aa1f-062dadd5140i'
+        default: return '11834805-1a77-4126-aa1f-062dadd5139h'
+    }
+}
+def getDeDbCreds (String environment) {
+    switch(environment) {
+        case "prod": return '11834805-1a77-4126-aa1f-062dadd5133b'
+        case "stage": return '11834805-1a77-4126-aa1f-062dadd5134c'
+        case "dev": return '11834805-1a77-4126-aa1f-062dadd5135d'
+        case "qa": return '11834805-1a77-4126-aa1f-062dadd5136e'
+        default: return '11834805-1a77-4126-aa1f-062dadd5135d'
+    }
+}
+def getCrtFileId (String environment) {
+     switch(environment) {
+        case "prod": return 'prod_certificate_crt'
+        case "stage": return 'stage_certificate_crt'
+        case "dev": return 'dev_certificate_crt_v2'
+        case "qa": return 'qa_certificate_crt_v2'
+        default: return "No environment selected"
+    }
+}
+def getPemFileId (String environment) {
+     switch(environment) {
+        case "prod": return 'prod_certificate_pem'
+        case "stage": return 'stage_certificate_pem'
+        case "dev": return 'dev_certificate_pem_v2'
+        case "qa": return 'qa_certificate_pem_v2'
+        default: return "No environment selected"
+    }
+}
+def getKeyFileId (String environment) {
+     switch(environment) {
+        case "prod": return 'prod_certificate_key'
+        case "stage": return 'stage_certificate_key'
+        case "dev": return 'dev_certificate_key_v2'
+        case "qa": return 'qa_certificate_key_v2'
+        default: return "No environment selected"
+    }
+}
+def getInternalComodoCrtFileId (String environment) {
+    switch(environment) {
+        case "prod": return 'patpca_internal_prod_comodo_certificate_crt'
+        case "stage": return 'patpca_internal_stage_comodo_certificate_crt'
+        case "dev": return 'patpca_internal_dev_comodo_certificate_crt'
+        case "qa": return 'patpca_internal_qa_comodo_certificate_crt'
+        case "prod-shared": return 'global_search_internal_prod_shared_certificate_crt'
+        case "nonprod-shared": return 'global_search_internal_nonprod_shared_certificate_crt'
+        default: return "No environment selected"
+    }
+}
+def getInternalComodoPemFileId (String environment) {
+    switch(environment) {
+        case "prod": return 'patpca_internal_prod_comodo_certificate_pem'
+        case "stage": return 'patpca_internal_stage_comodo_certificate_pem'
+        case "dev": return 'patpca_internal_dev_comodo_certificate_pem'
+        case "qa": return 'patpca_internal_qa_comodo_certificate_pem'
+        case "prod-shared": return 'global_search_internal_prod_shared_certificate_pem'
+        case "nonprod-shared": return 'global_search_internal_nonprod_shared_certificate_pem'
+        default: return "No environment selected"
+    }
+}
+def getInternalComodoKeyFileId (String environment) {
+    switch(environment) {
+        case "prod": return 'patpca_internal_prod_comodo_certificate_key'
+        case "stage": return 'patpca_internal_stage_comodo_certificate_key'
+        case "dev": return 'patpca_internal_dev_comodo_certificate_key'
+        case "qa": return 'patpca_internal_qa_comodo_certificate_key'
+        case "prod-shared": return 'global_search_internal_prod_shared_certificate_key'
+        case "nonprod-shared": return 'global_search_internal_nonprod_shared_certificate_key'
+        default: return "No environment selected"
+    }
+}
+
+def getAdCreds (String environment) {
+    switch(environment) {
+        case "dev":
+        case "qa":
+        case "nonprod-shared": return '11834805-1a77-4126-aa1f-062dadd5116f'
+        case "stage":
+        case "prod":
+        case "prod-shared": return '11834805-1a77-4126-aa1f-062dadd5125t'
+        default: return "No environment selected"
+    }
+}
+
+def getAdAdmin1Creds (String environment) {
+    switch(environment) {
+        case "dev":
+        case "qa":
+        case "nonprod-shared": return 'admin_credentials_user1'
+        case "stage":
+        case "prod":
+        case "prod-shared": return 'admin_credentials_user1'
+        default: return "No environment selected"
+    }
+}
+def getAdAdmin2Creds (String environment) {
+    switch(environment) {
+        case "dev":
+        case "qa":
+        case "nonprod-shared": return 'admin_credentials_user2'
+        case "stage":
+        case "prod":
+        case "prod-shared": return 'admin_credentials_user2'
+        default: return "No environment selected"
+    }
+}
+def getCmaADCreds (String environment) {
+    switch(environment) {
+        case "dev": return 'rds_member_credentials_dev'
+        case "qa": return 'rds_member_credentials_qa'
+        case "stage": return 'rds_member_credentials_staging'
+        case "prod": return 'rds_member_credentials_prod'
+        default: return 'rds_member_credentials_dev'
+    }
+}
+def getCmaDBCreds (String environment) {
+    switch(environment) {
+        case "dev": return 'sql_ws_credentials_dev'
+        case "qa": return 'sql_ws_credentials_qa'
+        case "stage": return 'sql_ws_credentials_staging'
+        case "prod": return 'sql_ws_credentials_prod'
+        default: return 'sql_ws_credentials_dev'
+    }
+}
